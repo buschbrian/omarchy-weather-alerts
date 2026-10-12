@@ -1,0 +1,539 @@
+#!/usr/bin/env python3
+"""Weather alerts for one place, for the Omarchy bar widget.
+
+NWS watches, warnings and advisories; NOAA SWPC geomagnetic storms at G2 / Kp 6 and above;
+the planetary Kp series; and the national centres' outlooks (SPC severe storms, mesoscale
+discussions and fire weather; WPC excessive rainfall and winter storm severity; CPC 3-14 day
+hazards; significant river flooding). The place is the one set in Omarchy's weather settings.
+NWS alerts and the outlooks cover the United States only; Kp and storms work anywhere.
+
+`weather-alerts` fetches, notifies new alerts once and writes the cache; `--bar` reads the
+cache only (no network); `--show` prints the cached alert text. Outlooks are shown, never
+notified. The cache lives in ~/.local/state/weather-alerts/ and is private to your account.
+"""
+from concurrent.futures import ThreadPoolExecutor
+import argparse
+import fcntl
+from datetime import datetime, timedelta, timezone
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import urllib.parse
+import urllib.request
+
+AGENT = 'weather-alerts/1.0 (github.com/buschbrian/omarchy-weather-alerts)'
+NWS = 'https://api.weather.gov/alerts/active'
+SWPC = 'https://services.swpc.noaa.gov/products/alerts.json'
+KP = 'https://services.swpc.noaa.gov/products/noaa-planetary-k-index-forecast.json'
+SCRIPT = Path(__file__).resolve()
+# The place: Omarchy's weather location, written by omarchy-weather-location and Omarchy's weather settings.
+WEATHER_LOCATION = Path.home() / '.local/state/omarchy/settings/weather.json'
+GEOCODE = 'https://geocoding-api.open-meteo.com/v1/search'  # the geocoder Omarchy's weather panel uses
+MAPSERVICES = 'https://mapservices.weather.noaa.gov/vector/rest/services'
+OUTLOOK_TTL = timedelta(minutes=30)  # the centres reissue a few times a day
+# (service, layer, centre, product): national-centre outlooks queried at the point
+OUTLOOK_LAYERS = [
+    ('outlooks/SPC_wx_outlks', 1, 'SPC', 'Severe storms, day 1'),
+    ('outlooks/SPC_wx_outlks', 9, 'SPC', 'Severe storms, day 2'),
+    ('outlooks/SPC_wx_outlks', 17, 'SPC', 'Severe storms, day 3'),
+    ('outlooks/spc_mesoscale_discussion', 0, 'SPC', 'Mesoscale discussion'),
+    ('fire_weather/SPC_firewx', 1, 'SPC', 'Fire weather, day 1'),
+    ('fire_weather/SPC_firewx', 4, 'SPC', 'Fire weather, day 2'),
+    ('hazards/wpc_precip_hazards', 0, 'WPC', 'Excessive rainfall, day 1'),
+    ('hazards/wpc_precip_hazards', 1, 'WPC', 'Excessive rainfall, day 2'),
+    ('hazards/wpc_precip_hazards', 2, 'WPC', 'Excessive rainfall, day 3'),
+    ('outlooks/wpc_wssi', 4, 'WPC', 'Winter storm severity, days 1-3'),
+    ('hazards/cpc_weather_hazards', 1, 'CPC', 'Temperature hazards, days 3-7'),
+    ('hazards/cpc_weather_hazards', 4, 'CPC', 'Precipitation hazards, days 3-7'),
+    ('hazards/cpc_weather_hazards', 7, 'CPC', 'Wildfire and drought, days 3-7'),
+    ('hazards/cpc_weather_hazards', 3, 'CPC', 'Temperature hazards, days 8-14'),
+    ('hazards/cpc_weather_hazards', 6, 'CPC', 'Precipitation hazards, days 8-14'),
+    ('hazards/cpc_weather_hazards', 8, 'CPC', 'Wildfire and drought, days 8-14'),
+    ('outlooks/sig_riv_fld_outlk', 0, 'NWS', 'Significant river flooding'),
+]
+# General thunder (TSTM) is not a severe-storm risk, so it is left out.
+SPC_CATEGORY = {'MRGL': 'Minor', 'SLGT': 'Moderate', 'ENH': 'Moderate', 'MDT': 'Severe', 'HIGH': 'Extreme'}
+FIRE_LEVEL = {5: ('Elevated', 'Minor'), 8: ('Critical', 'Severe'), 10: ('Extremely critical', 'Extreme')}
+ERO_LEVEL = {'Marginal': 'Minor', 'Slight': 'Moderate', 'Moderate': 'Severe', 'High': 'Extreme'}
+WSSI_LEVEL = {'WINTER WEATHER AREA': ('Winter weather', 'Minor'), 'MINOR': ('Minor impacts', 'Minor'),
+              'MODERATE': ('Moderate impacts', 'Moderate'), 'MAJOR': ('Major impacts', 'Severe'),
+              'EXTREME': ('Extreme impacts', 'Extreme')}
+RIVER_LEVEL = {'Possible': 'Minor', 'Likely': 'Moderate', 'Occurring': 'Severe'}
+STATE = Path(os.environ.get('XDG_STATE_HOME', Path.home() / '.local/state')) / 'weather-alerts'
+# NWS, SPC, WPC and CPC cover the US and its territories; boxes are (south, north, west, east).
+US_BOXES = [(24.3, 49.6, -125.1, -66.8), (51.0, 71.6, -179.9, -129.0), (51.0, 53.2, 172.0, 180.0),
+            (18.7, 22.4, -160.7, -154.7), (17.6, 18.6, -67.4, -64.5), (13.0, 20.7, 144.5, 146.1),
+            (-14.7, -14.1, -171.2, -168.0)]
+URGENCY = {'Extreme': 'critical', 'Severe': 'critical', 'Moderate': 'normal'}
+# SWPC products at G2 / Kp 6 or higher: K-index warnings (W) and alerts (A), G2/G3 storm watches
+STORM = re.compile(r'^(K0[6-9][WA]|A30F|A50F)$')
+STORM_WINDOW = {'W': timedelta(hours=24), 'A': timedelta(hours=12), 'F': timedelta(days=3)}
+# Bar/panel glyph by event keyword, first match wins (Nerd Font Material Design)
+ICONS = [('tornado', '\U000F0F38'), ('thunder', '\U000F0593'), ('severe storm', '\U000F0593'), ('mesoscale', '\U000F0593'),
+         ('rainfall', '\U000F0597'), ('flood', '\U000F058C'), ('hydrologic', '\U000F058C'),
+         ('fire', '\U000F0238'), ('red flag', '\U000F0238'), ('winter', '\U000F0717'), ('snow', '\U000F0717'),
+         ('blizzard', '\U000F0717'), ('ice', '\U000F0717'), ('freeze', '\U000F0717'), ('frost', '\U000F0717'),
+         ('avalanche', '\U000F0717'), ('wind', '\U000F059D'), ('heat', '\U000F0F37'), ('fog', '\U000F0591'),
+         ('smoke', '\U000F0591'), ('dust', '\U000F0591'), ('air quality', '\U000F0591'), ('geomagnetic', '\U000F0B44')]
+STALE_AFTER = timedelta(minutes=15)
+SEVERITY_RANK = {'Extreme': 4, 'Severe': 3, 'Moderate': 2, 'Minor': 1}
+
+
+def fetch(url):
+    request = urllib.request.Request(url, headers={'User-Agent': AGENT, 'Accept': 'application/geo+json'})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return json.load(response)
+
+
+def nws_alerts(features):
+    out = []
+    for feature in features:
+        p = feature['properties']
+        if p.get('status') != 'Actual' or p.get('messageType') == 'Cancel':
+            continue
+        zones = [z.strip() for z in (p.get('areaDesc') or '').split(';') if z.strip()]
+        out.append({'id': p['id'], 'source': 'NWS', 'event': p['event'], 'severity': p.get('severity') or 'Unknown',
+                    'urgency': p.get('urgency') or '', 'certainty': p.get('certainty') or '',
+                    'references': [r['identifier'] for r in p.get('references', []) if r.get('identifier')],
+                    'instruction': p.get('instruction') or '', 'full_area': p.get('areaDesc') or '',
+                    'area': zones[0] + (f' +{len(zones) - 1} more' if len(zones) > 1 else '') if zones else '',
+                    'onset': p.get('onset') or p.get('effective'),
+                    'headline': p.get('headline') or p['event'], 'until': p.get('ends') or p.get('expires'),
+                    'text': '\n\n'.join(filter(None, [p.get('headline'), p.get('description'), p.get('instruction')]))})
+    return out
+
+
+def storm_alerts(products, now):
+    out = []
+    for item in products:
+        code = item['product_id']
+        if not STORM.match(code):
+            continue
+        issued = datetime.fromisoformat(item['issue_datetime'].replace(' ', 'T')).replace(tzinfo=timezone.utc)
+        if now - issued > STORM_WINDOW[code[-1]]:
+            continue
+        lines = [l.strip() for l in item['message'].replace('\r', '').split('\n') if l.strip()]
+        until = issued + STORM_WINDOW[code[-1]]
+        if code.endswith('F'):
+            until = watch_end(item['message'], issued)
+            if until is None or until < now:
+                continue
+        title = next((l for l in lines if l.startswith(('WATCH:', 'WARNING:', 'ALERT:', 'EXTENDED WARNING:'))), code)
+        serial = next((l.split(':', 1)[1].strip() for l in lines if l.startswith('Serial Number')), '')
+        out.append({'id': f'swpc-{code}-{serial}', 'source': 'SWPC', 'event': 'Geomagnetic storm',
+                    'severity': 'Moderate', 'headline': title, 'issued': issued.isoformat(),
+                    'urgency': 'Expected' if code.endswith('A') else 'Future', 'certainty': '', 'area': 'Planetary',
+                    'onset': issued.isoformat(), 'until': until.isoformat(),
+                    'text': '\n'.join(lines) + '\n\nAurora: higher Kp reaches lower latitudes. Whether you can see it '
+                            'depends on your latitude, darkness, clouds and a clear horizon toward the pole.'})
+    seen, unique = set(), []
+    for alert in sorted(out, key=lambda a: a['issued'], reverse=True):
+        key = alert['headline']
+        if key not in seen:
+            seen.add(key)
+            unique.append(alert)
+    return unique
+
+
+def watch_end(message, issued):
+    """End (UTC) of the last day a watch predicts G2 or stronger, e.g. 'Oct 09:  G2 (Moderate)'."""
+    days = [d for d, g in re.findall(r'([A-Z][a-z]{2} \d{2}):\s+G(\d)', message) if int(g) >= 2]
+    if not days:
+        return None
+    last = datetime.strptime(f'{days[-1]} {issued.year}', '%b %d %Y').replace(tzinfo=timezone.utc)
+    if last < issued - timedelta(days=2):  # watch issued in late December for January
+        last = last.replace(year=issued.year + 1)
+    return last + timedelta(days=1)
+
+
+def kp_series(rows, now):
+    """SWPC planetary Kp in 3-hour bins from a day ago through the 3-day forecast."""
+    out = []
+    for row in rows:
+        t = datetime.fromisoformat(row['time_tag']).replace(tzinfo=timezone.utc)
+        if t >= now - timedelta(hours=24):
+            out.append({'time': row['time_tag'], 'kp': round(float(row['kp']), 2),
+                        'observed': row.get('observed') or '', 'scale': row.get('noaa_scale')})
+    return out
+
+
+def outlook_time(value):
+    """The services' several time formats, as an aware UTC datetime (None when unreadable)."""
+    if value in (None, ''):
+        return None
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value / 1000, timezone.utc)
+    for fmt in ('%Y%m%d%H%M', '%Y-%m-%d %H:%M:%S', '%HZ %m/%d/%y'):
+        try:
+            return datetime.strptime(value, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def outlook_entries(service, centre, product, features):
+    """One entry per distinct level at the point, worst first, from a layer's query features."""
+    found = {}
+    for feature in features:
+        a = feature.get('attributes', {})
+        start, end = None, None
+        if service == 'outlooks/SPC_wx_outlks':
+            if a.get('label') not in SPC_CATEGORY:
+                continue
+            level, severity = a.get('label2') or a['label'], SPC_CATEGORY[a['label']]
+            start, end = outlook_time(a.get('valid')), outlook_time(a.get('expire'))
+        elif service == 'outlooks/spc_mesoscale_discussion':
+            if not a.get('name') or a['name'] == 'NoArea':
+                continue
+            level, severity = a['name'], 'Moderate'
+        elif service == 'fire_weather/SPC_firewx':
+            if a.get('dn') not in FIRE_LEVEL:
+                continue
+            level, severity = FIRE_LEVEL[a['dn']]
+            start, end = outlook_time(a.get('valid')), outlook_time(a.get('expire'))
+        elif service == 'hazards/wpc_precip_hazards':
+            word = (a.get('outlook') or '').split(' ')[0]
+            if word not in ERO_LEVEL:
+                continue
+            level, severity = a['outlook'], ERO_LEVEL[word]
+            start, end = outlook_time(a.get('start_time')), outlook_time(a.get('end_time'))
+        elif service == 'outlooks/wpc_wssi':
+            if a.get('impact') not in WSSI_LEVEL:
+                continue
+            level, severity = WSSI_LEVEL[a['impact']]
+            start, end = outlook_time(a.get('start_time')), outlook_time(a.get('end_time'))
+        elif service == 'hazards/cpc_weather_hazards':
+            if not a.get('label'):
+                continue
+            level = a['label']
+            severity = 'Severe' if 'High Risk' in level else 'Moderate' if 'Moderate Risk' in level else 'Minor'
+            start, end = outlook_time(a.get('start_date')), outlook_time(a.get('end_date'))
+        else:
+            if a.get('outlook') not in RIVER_LEVEL:
+                continue
+            level, severity = a['outlook'], RIVER_LEVEL[a['outlook']]
+            start, end = outlook_time(a.get('start_time')), outlook_time(a.get('end_time'))
+        entry = {'id': f'{service}:{product}:{level}', 'centre': centre, 'product': product, 'level': level,
+                 'severity': severity, 'start': start.isoformat() if start else None, 'end': end.isoformat() if end else None}
+        found[entry['id']] = entry
+    entries = sorted(found.values(), key=lambda e: -SEVERITY_RANK[e['severity']])
+    # Overlapping categorical polygons (general thunder inside marginal) keep only the worst for SPC/WPC days.
+    return entries if service == 'hazards/cpc_weather_hazards' else entries[:1]
+
+
+def fetch_outlooks(lat, lon):
+    """Every outlook layer that covers the point; a failed layer fails the whole source."""
+    def query(layer):
+        service, index, centre, product = layer
+        url = f'{MAPSERVICES}/{service}/MapServer/{index}/query?' + urllib.parse.urlencode({
+            'geometry': f'{lon:.4f},{lat:.4f}', 'geometryType': 'esriGeometryPoint', 'inSR': 4326,
+            'spatialRel': 'esriSpatialRelIntersects', 'outFields': '*', 'returnGeometry': 'false', 'f': 'json'})
+        body = fetch(url)
+        if 'error' in body:
+            raise ValueError(body['error'])
+        return outlook_entries(service, centre, product, body.get('features', []))
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        return [entry for entries in pool.map(query, OUTLOOK_LAYERS) for entry in entries]
+
+
+def geocode(query):
+    """Up to five places for a search, as Omarchy's weather panel finds them."""
+    url = GEOCODE + '?' + urllib.parse.urlencode({'name': query, 'count': 5, 'language': 'en', 'format': 'json'})
+    return [{'name': r['name'], 'lat': r['latitude'], 'lon': r['longitude'],
+             'label': ', '.join(x for x in (r['name'], r.get('admin1'), r.get('country_code')) if x)}
+            for r in fetch(url).get('results') or []]
+
+
+def icon(event):
+    lower = event.lower()
+    return next((glyph for key, glyph in ICONS if key in lower), '\U000F0026')
+
+
+def location():
+    """(lat, lon, name) from Omarchy's weather settings, or None when no place is set."""
+    try:
+        saved = json.loads(WEATHER_LOCATION.read_text())
+        return float(saved['latitude']), float(saved['longitude']), saved.get('name') or ''
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def in_us(lat, lon):
+    return any(s <= lat <= n and w <= lon <= e for s, n, w, e in US_BOXES)
+
+
+def notify(alert, reason=None):
+    level = URGENCY.get(alert['severity'], 'low')
+    glyph = '\U000F0F2F' if alert['source'] == 'SWPC' else '\U000F0026'
+    subprocess.run(['omarchy-notification-send', '--app-name', 'Weather alert', '-g', glyph, '-u', level,
+                    alert['event'] + (f' · {reason}' if reason else ''), alert['headline'],
+                    '--exec', 'omarchy-launch-tui', '--app-id=TUI.float', 'python3', str(SCRIPT), '--show', '--pager',
+                    '--id', alert['id']],
+                   check=False)
+
+
+def short_time(iso):
+    if not iso:
+        return ''
+    return datetime.fromisoformat(iso).astimezone().strftime('%a %H:%M')
+
+
+def stamp(value):
+    if not value:
+        return None
+    t = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+
+
+def active_alerts(alerts, now):
+    return [a for a in alerts if not a.get('until') or stamp(a['until']) > now]
+
+
+def summary(alert):
+    return {k: ' '.join(str(alert.get(k) or '').split()) for k in
+            ('event', 'severity', 'urgency', 'certainty', 'instruction', 'full_area', 'until')}
+
+
+def change_reason(alert, previous):
+    if not isinstance(previous, dict) or 'summary' not in previous:
+        return None
+    old, new = previous['summary'], summary(alert)
+    if SEVERITY_RANK.get(new['severity'], 0) > SEVERITY_RANK.get(old.get('severity'), 0):
+        return 'Escalated'
+    if any(new[k] != old.get(k, '') for k in new if k != 'until'):
+        return 'Updated'
+    before, after = stamp(old.get('until')), stamp(new['until'])
+    if before and after and after - before >= timedelta(minutes=30):
+        return 'Extended'
+    return None
+
+
+def private_dir(path):
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.chmod(0o700)
+
+
+def atomic_json(path, value):
+    """Write through a temp file created 0600, so the place is never readable by other accounts."""
+    tmp = path.with_suffix('.tmp')
+    tmp.unlink(missing_ok=True)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        f.write(json.dumps(value) + '\n')
+    tmp.replace(path)
+
+
+def update(notifications=True):
+    private_dir(STATE)
+    with os.fdopen(os.open(STATE / 'update.lock', os.O_WRONLY | os.O_CREAT, 0o600), 'w') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        update_locked(notifications)
+
+
+def update_locked(notifications=True):
+    place = location()
+    lat, lon, name = place if place else (None, None, '')
+    coverage = 'none' if place is None else 'us' if in_us(lat, lon) else 'outside'
+    now = datetime.now(timezone.utc)
+    previous = read_current()
+    point = [round(lat, 4), round(lon, 4)] if place else None
+    same_place = previous.get('point') == point
+    old_alerts = previous.get('alerts', [])
+    sources, alerts = {}, []
+    kp = previous.get('kp', [])
+    jobs = [('SWPC', lambda: storm_alerts(fetch(SWPC), now)),
+            ('Kp', lambda: kp_series(fetch(KP), now))]
+    if coverage == 'us':
+        jobs.insert(0, ('NWS', lambda: nws_alerts(fetch(f'{NWS}?point={lat:.4f},{lon:.4f}')['features'])))
+    for source, get in jobs:
+        old = previous.get('sources', {}).get(source, {})
+        fetched = old.get('updated') if source != 'NWS' or same_place else None
+        try:
+            data = get()
+            fetched, error = now.isoformat(), False
+        except (OSError, ValueError, KeyError, TypeError):
+            data = kp if source == 'Kp' else [a for a in old_alerts if a.get('source') == source
+                                             and (source != 'NWS' or same_place)]
+            error = True
+        sources[source] = {'updated': fetched, 'checked': now.isoformat(), 'error': error}
+        if source == 'Kp':
+            kp = data
+        else:
+            alerts.extend(active_alerts(data, now))
+    old = previous.get('sources', {}).get('Outlooks', {})
+    outlooks = previous.get('outlooks', []) if same_place else []
+    if coverage != 'us':
+        outlooks = []
+    elif same_place and old.get('updated') and not old.get('error') and now - stamp(old['updated']) < OUTLOOK_TTL:
+        sources['Outlooks'] = old
+    else:
+        try:
+            outlooks = fetch_outlooks(lat, lon)
+            sources['Outlooks'] = {'updated': now.isoformat(), 'checked': now.isoformat(), 'error': False}
+        except (OSError, ValueError, KeyError, TypeError):
+            sources['Outlooks'] = {'updated': old.get('updated') if same_place else None, 'checked': now.isoformat(), 'error': True}
+    outlooks = [o for o in outlooks if not o.get('end') or stamp(o['end']) > now]
+    atomic_json(STATE / 'current.json', {'place': name, 'point': point, 'coverage': coverage,
+                                       'at': now.isoformat(), 'sources': sources, 'alerts': alerts, 'kp': kp,
+                                       'outlooks': outlooks})
+    seen_file = STATE / 'seen.json'
+    try:
+        seen = json.loads(seen_file.read_text())
+    except (OSError, ValueError):
+        seen = {}
+    for alert in alerts:
+        known = seen.get(alert['id'])
+        refs = [seen[r] for r in alert.get('references', []) if r in seen]
+        predecessor = max((r for r in refs if isinstance(r, dict)), key=lambda r: r['at'], default=None)
+        baseline = known or predecessor
+        reason = change_reason(alert, baseline)
+        if notifications and (baseline is None or reason):
+            notify(alert, reason)
+        # Keep the last notified summary so small extensions accumulate to the threshold.
+        saved = baseline['summary'] if isinstance(baseline, dict) and not reason else summary(alert)
+        seen[alert['id']] = {'at': now.isoformat(), 'summary': saved}
+    cutoff = (now - timedelta(days=7)).isoformat()
+    atomic_json(seen_file, {k: v for k, v in seen.items() if (v['at'] if isinstance(v, dict) else v) > cutoff})
+
+
+def read_current():
+    try:
+        return json.loads((STATE / 'current.json').read_text())
+    except (OSError, ValueError):
+        return {'place': '', 'alerts': [], 'coverage': 'pending'}
+
+
+def bar(current, now=None):
+    """Badge for the bar plus everything the alerts panel draws, from the cache only."""
+    now = now or datetime.now(timezone.utc)
+    alerts = sorted(active_alerts(current['alerts'], now), key=lambda a: -SEVERITY_RANK.get(a['severity'], 0))
+    kp = [k for k in current.get('kp') or [] if stamp(k['time']) + timedelta(hours=3) > now - timedelta(hours=24)]
+    coverage = current.get('coverage', 'pending')
+    sources = []
+    for name in ('NWS', 'SWPC', 'Kp', 'Outlooks'):
+        if name in ('NWS', 'Outlooks') and coverage != 'us':
+            continue  # not queried: no place, or a place outside the United States
+        status = current.get('sources', {}).get(name, {})
+        updated = status.get('updated')
+        stale = not updated or now - stamp(updated) > (OUTLOOK_TTL * 2 if name == 'Outlooks' else STALE_AFTER)
+        sources.append({'name': name, 'updated': updated, 'error': status.get('error', False), 'stale': stale})
+    # Outlooks are context, not warnings: a failed outlook query never puts "?" on the badge.
+    degraded = any(s['error'] or s['stale'] for s in sources if s['name'] != 'Outlooks')
+    outlooks = sorted((o for o in current.get('outlooks') or [] if not o.get('end') or stamp(o['end']) > now),
+                      key=lambda o: -SEVERITY_RANK.get(o['severity'], 0))
+    observed = [k for k in kp if k.get('observed') != 'predicted' and stamp(k['time']) <= now]
+    predicted = [k for k in kp if k.get('observed') == 'predicted' and stamp(k['time']) + timedelta(hours=3) > now]
+    panel = {'place': current.get('place', ''), 'coverage': coverage, 'updated': current.get('at'), 'alerts': [], 'kp': kp,
+             'sources': sources, 'degraded': degraded, 'tz': str(datetime.now().astimezone().tzinfo),
+             'kp_now': next((k['kp'] for k in reversed(observed) if stamp(k['time']) + timedelta(hours=3) > now), None),
+             'kp_observed_peak': max(observed, key=lambda k: k['kp'], default=None),
+             'kp_forecast_peak': max(predicted, key=lambda k: k['kp'], default=None),
+             'kp_max': max(kp, key=lambda k: k['kp'], default=None),
+             'outlooks': [{**o, 'icon': icon(o['product'] + ' ' + o['level']),
+                           'when': ' – '.join(short_time(t) for t in (o.get('start'), o.get('end')) if t)} for o in outlooks]}
+    for a in alerts:
+        start = datetime.fromisoformat(a['onset']) if a.get('onset') else None
+        end = datetime.fromisoformat(a['until']) if a.get('until') else None
+        progress = None
+        if start and end and end > start:
+            progress = round(min(max((now - start) / (end - start), 0), 1), 3)
+        panel['alerts'].append({'id': a.get('id'), 'text': a.get('text', ''),
+                                'instruction': a.get('instruction', ''), 'full_area': a.get('full_area') or a.get('area', ''),
+                                'event': a['event'], 'source': a.get('source', ''), 'severity': a['severity'],
+                                'urgency': a.get('urgency', ''), 'certainty': a.get('certainty', ''),
+                                'area': a.get('area', ''), 'headline': a.get('headline', a['event']), 'icon': icon(a['event']),
+                                'onset': short_time(a.get('onset')), 'until': short_time(a['until']),
+                                'left': left(end - now) if end else '', 'progress': progress})
+    if not alerts:
+        quiet = {'none': 'No place set: click to set one', 'outside': 'No active storm alerts (NWS alerts cover the US only)'}
+        return {'text': '\U000F0026 ?' if degraded else '',
+                'tooltip': 'Alerts · could not confirm all feeds' if degraded else quiet.get(coverage, 'No active alerts'),
+                'class': 'low' if degraded else 'none', 'panel': panel}
+    worst = 'critical' if any(URGENCY.get(a['severity']) == 'critical' for a in alerts) else \
+            'normal' if any(URGENCY.get(a['severity']) == 'normal' for a in alerts) else 'low'
+    lines = [f"{a['event']} until {short_time(a['until'])}" if a['until'] else a['event'] for a in alerts]
+    place = f" for {current['place']}" if current.get('place') else ''
+    # Nerd Font glyphs draw wider than their cell, so each needs a full space after it.
+    kinds = list(dict.fromkeys(icon(a['event']) for a in alerts))[:3]
+    text = ' '.join(kinds) + (f' {len(alerts)}' if len(alerts) > len(kinds) else '')
+    if degraded:
+        text += ' ?'
+    return {'text': text, 'class': worst,
+            'severity': alerts[0]['severity'], 'panel': panel,
+            'tooltip': f'Alerts{place}\n' + '\n'.join(lines)
+                       + ('\nSome feeds could not be confirmed; check source timestamps.' if degraded else '')
+                       + '\n\nClick for details'}
+
+
+def left(delta):
+    minutes = int(delta.total_seconds() // 60)
+    if minutes <= 0:
+        return 'ending'
+    if minutes < 60:
+        return f'{minutes}m left'
+    hours = minutes // 60
+    return f'{hours}h left' if hours < 48 else f'{hours // 24}d left'
+
+
+def show(current, alert_id=None, now=None):
+    alerts = active_alerts(current['alerts'], now or datetime.now(timezone.utc))
+    if alert_id:
+        alerts = [a for a in alerts if a.get('id') == alert_id]
+        if not alerts:
+            return 'This alert has ended or is no longer in the current feed.'
+    if not alerts:
+        return ('Could not confirm whether all feeds are clear.' if bar(current, now)['panel']['degraded'] else
+                f"No active alerts{' for ' + current['place'] if current.get('place') else ''}.")
+    blocks = [f"== {a['event']} ({a['source']}, {a['severity']})"
+              + (f", until {short_time(a['until'])}" if a['until'] else '') + f" ==\n\n{a['text']}"
+              for a in alerts]
+    warning = 'Some feeds could not be confirmed; cached alerts shown.\n\n' if bar(current, now)['panel']['degraded'] else ''
+    return warning + '\n\n\n'.join(blocks)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--bar', action='store_true', help='badge JSON from the cache (no network)')
+    parser.add_argument('--no-notify', action='store_true', help='fetch and cache without desktop notifications')
+    parser.add_argument('--show', action='store_true', help='full text of the cached alerts')
+    parser.add_argument('--id', help='with --show: show one alert')
+    parser.add_argument('--pager', action='store_true', help='with --show: page it and wait')
+    parser.add_argument('--geocode', metavar='QUERY', help='print up to five matching places as JSON')
+    parser.add_argument('--set-location', metavar='NAME', help='with --lat/--lon: set the shared weather location, then fetch')
+    parser.add_argument('--lat', type=float)
+    parser.add_argument('--lon', type=float)
+    args = parser.parse_args(argv)
+    if args.geocode is not None:
+        try:
+            print(json.dumps(geocode(args.geocode), ensure_ascii=False))
+        except (OSError, ValueError, KeyError, TypeError):
+            print('[]')
+    elif args.set_location:
+        if (args.lat is None or args.lon is None or not -90 <= args.lat <= 90 or not -180 <= args.lon <= 180):
+            parser.error('--set-location needs a valid --lat and --lon')
+        command = ['omarchy-weather-location', '--set', args.set_location, f'{args.lat},{args.lon}']
+        try:
+            subprocess.run(command, check=True)
+        except (OSError, subprocess.CalledProcessError):
+            sys.exit('Could not change the location: omarchy-weather-location failed or is missing.')
+        update(not args.no_notify)
+    elif args.bar:
+        print(json.dumps(bar(read_current()), ensure_ascii=False))
+    elif args.show:
+        text = show(read_current(), args.id)
+        if args.pager:
+            subprocess.run(['less', '-R'], input=text, text=True)
+        else:
+            print(text)
+    else:
+        update(not args.no_notify)
+
+
+if __name__ == '__main__':
+    main()

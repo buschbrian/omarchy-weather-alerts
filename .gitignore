@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.DS_Store
+# local scratch: screenshots, captures and notes made while working on the widget
+scratch/
+*.log

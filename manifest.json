@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "buschbrian.weather-alerts",
+  "name": "Weather alerts",
+  "version": "1.0.0",
+  "author": "Brian Busch",
+  "license": "MIT",
+  "description": "Active NWS alerts, NOAA geomagnetic storm alerts, Kp and the national severe-storm, rainfall, fire, winter and river outlooks for your Omarchy weather location. A bar glyph, a panel, and one desktop notification per new alert. NWS data covers the United States.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "Widget.qml"
+  },
+  "barWidget": {
+    "displayName": "Weather alerts",
+    "description": "Active weather alerts and outlooks; click for the alert list, outlooks and Kp",
+    "category": "Info",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "schema": [
+      { "key": "notifications", "type": "boolean", "label": "Desktop notifications", "defaultValue": true, "description": "Notify once for each new alert, and again when it escalates or changes. Alerts are still listed when off." },
+      { "key": "refreshMinutes", "type": "integer", "label": "Refresh (minutes)", "min": 5, "max": 60, "step": 5, "defaultValue": 5, "description": "How often alerts are fetched while the shell is running. Outlooks are refreshed at most every 30 minutes." }
+    ]
+  }
+}
